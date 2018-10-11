@@ -1,11 +1,3 @@
-\section*{Appendices}
-\addcontentsline{toc}{section}{Appendices}
-\renewcommand{\thesubsection}{\Alph{subsection}}
-
-\noindent
-
-\subsection{IEC104Boo}
-\begin{lstlisting}[breaklines=true][language=Python]
 import csv
 import argparse
 from boofuzz import *
@@ -239,4 +231,3 @@ if __name__ == '__main__':
     p.add_argument('--interrogation', action='store_true')
     args = p.parse_args()
     main(args.ip, args.port, testfr=args.testfr, pre_startdt=args.startdt, interrogation=args.interrogation)
-\end{lstlisting}
