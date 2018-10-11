@@ -1,0 +1,242 @@
+\section*{Appendices}
+\addcontentsline{toc}{section}{Appendices}
+\renewcommand{\thesubsection}{\Alph{subsection}}
+
+\noindent
+
+\subsection{IEC104Boo}
+\begin{lstlisting}[breaklines=true][language=Python]
+import csv
+import argparse
+from boofuzz import *
+
+
+class IECSession(Session):
+    def __init__(self, pre_startdt=False, testfr=False, interrogation=False, *args, **kwargs):
+        self.pre_startdt = pre_startdt
+        self.testfr = testfr
+        self.interrogation = interrogation
+        super(IECSession, self).__init__(*args, **kwargs)
+
+    def write_csv(self, row):
+        with open('test.csv', 'ab') as csv_file:
+            csv_writer = csv.writer(csv_file)
+            csv_writer.writerow(row)
+
+    def pre_send(self, target):
+        if self.pre_startdt:
+            # STARTDT ACT request
+            b = bytearray((0x68, 0x04, 0x07, 0x00, 0x00, 0x00))
+            target.send(str(b))
+            recv_bytes = target.recv(1000)
+
+    def post_send(self, target, fuzz_data_logger, session, sock):
+        try:
+            # Receive result of fuzz
+            while True:
+                recv_bytes = target.recv(1000)
+                resv_string = recv_bytes.encode('hex')
+                # If timeout break
+                if resv_string == '':
+                    fuzz_data_logger.log_info('Timeout, continue with verification')
+                    break
+            if self.interrogation:
+                row = [session.last_send.encode('hex')]
+                fuzz_data_logger.open_test_step('Send Interrogation')
+                if not self.pre_startdt:
+                    # STARTDT ACT request
+                    b = bytearray((0x68, 0x04, 0x07, 0x00, 0x00, 0x00))
+                    target.send(str(b))
+                    recv_bytes = target.recv(1000)
+                # interrogation request activation
+                # common asdu addr 1, remember lsb first in addressing
+                b = bytearray((0x68, 0x0E, 0x00, 0x00, 0x00, 0x00, 0x64, 0x01, 0x06, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x14))
+                # common asdu addr 65535, broadcast, remember lsb first in addressing
+                # b = bytearray((0x68, 0x0E, 0x00, 0x00, 0x00, 0x00, 0x64, 0x01, 0x06, 0x00, 0xff, 0xff, 0x00, 0x00, 0x00, 0x14))
+                target.send(str(b))
+                # we dont know the number to results to loop until deactivation response
+                while True:
+                    recv_bytes = target.recv(1000)
+                    # decode to hex so that its easier to handle
+                    resv_string = recv_bytes.encode('hex')
+                    # check for interrogation
+                    if resv_string[12:14] == '64':
+                        # check if its deactivation (activation = 07)
+                        if resv_string[16:18] == '0a':
+                            fuzz_data_logger.log_info('Deactivation recived')
+                            break
+                        else:
+                            fuzz_data_logger.log_info('Activation confirmed')
+                    elif resv_string == '':
+                        fuzz_data_logger.log_fail('Timeout waiting for reply')
+                        break
+                    else:
+                        row.append(resv_string)
+            if self.testfr:
+                fuzz_data_logger.open_test_step('Send TESTFR act')
+                b = bytearray((0x68, 0x04, 0x43, 0x00, 0x00, 0x00))
+                target.send(str(b))
+                recv_bytes = target.recv(1000)
+                resv_string = recv_bytes.encode('hex')
+                if resv_string == '':
+                    fuzz_data_logger.log_fail('No TESTFR response for: {}'.format(session.last_send.encode('hex')))
+                elif resv_string == '680483000000':
+                    fuzz_data_logger.log_pass('TESTFR con received')
+                else:
+                    fuzz_data_logger.log_error('Unexpected response: {}'.format(resv_string))
+            target.close()
+        except sex.BoofuzzTargetConnectionAborted:
+            fuzz_data_logger.log_fail('Target connection error, probably down')
+
+
+def main(ip, port=2404, pre_startdt=False, testfr=False, interrogation=False):
+    log_file = FuzzLoggerText(file_handle=open('session.log', 'wb'))
+    log_stdout = FuzzLoggerText()
+    log = FuzzLogger(fuzz_loggers=[log_file, log_stdout])
+    target = Target(connection=SocketConnection(ip, port, proto='tcp', timeout=2))
+    # we don't expect the rtu to respond to every message so disable that check
+    session = IECSession(
+        target=target,
+        sleep_time=0.2,
+        check_data_received_each_request=False,
+        session_filename='session.data',
+        fuzz_data_logger=log,
+        pre_startdt=pre_startdt,
+        testfr=testfr,
+        interrogation=interrogation
+    )
+
+    s_initialize('random_bytes')
+    s_random(0x00, 0, 65535)
+
+    s_initialize('s_frame_random_cf')
+    s_byte(0x68, name='start', fuzzable=False)
+    s_byte(0x04, name='apdu_length', fuzzable=False)
+    with s_block('s_frame'):
+        # with s_block('cf1'):
+        #    s_bit_field(1, width=2, name='control_field_1_1', fuzzable=False)
+        #    s_bit_field(0, width=2, name='control_field_1_2')
+        s_byte(0x01, name='control_field_1', fuzzable=False)
+        s_byte(0x00, name='control_field_2')
+        s_byte(0x00, name='control_field_3')
+        s_byte(0x00, name='control_field_4')
+
+    s_initialize('s_frame_append_random')
+    s_byte(0x68, name='start', fuzzable=False)
+    s_size('asdu', name='apdu_length', length=1, offset=4, fuzzable=False)
+    with s_block('s_frame'):
+        s_byte(0x01, name='control_field_1', fuzzable=False)
+        s_byte(0x00, name='control_field_2', fuzzable=False)
+        s_byte(0x00, name='control_field_3', fuzzable=False)
+        s_byte(0x00, name='control_field_4', fuzzable=False)
+    with s_block('asdu'):
+        s_random(0x00, 0, 251, name='random_bytes')
+
+    s_initialize('testfr_act_random_cf')
+    s_byte(0x68, name='start', fuzzable=False)
+    s_byte(0x04, name='apdu_length', fuzzable=False)
+    with s_block('u_frame'):
+        s_byte(0x43, name='control_field_1', fuzzable=False)
+        s_byte(0x00, name='control_field_2')
+        s_byte(0x00, name='control_field_3')
+        s_byte(0x00, name='control_field_4')
+
+    s_initialize('testfr_con_random_cf')
+    s_byte(0x68, name='start', fuzzable=False)
+    s_byte(0x04, name='apdu_length', fuzzable=False)
+    with s_block('u_frame'):
+        s_byte(0x83, name='control_field_1', fuzzable=False)
+        s_byte(0x00, name='control_field_2')
+        s_byte(0x00, name='control_field_3')
+        s_byte(0x00, name='control_field_4')
+
+    s_initialize('testfr_act_append_random')
+    s_byte(0x68, name='start', fuzzable=False)
+    s_size('asdu', name='apdu_length', length=1, offset=4, fuzzable=False)
+    with s_block('u_frame'):
+        s_byte(0x43, name='control_field_1', fuzzable=False)
+        s_byte(0x00, name='control_field_2', fuzzable=False)
+        s_byte(0x00, name='control_field_3', fuzzable=False)
+        s_byte(0x00, name='control_field_4', fuzzable=False)
+    with s_block('asdu'):
+        s_random(0x00, 0, 251, name='random_bytes')
+
+    s_initialize('testfr_con_append_random')
+    s_byte(0x68, name='start', fuzzable=False)
+    s_size('asdu', name='apdu_length', length=1, offset=4, fuzzable=False)
+    with s_block('u_frame'):
+        s_byte(0x83, name='control_field_1', fuzzable=False)
+        s_byte(0x00, name='control_field_2', fuzzable=False)
+        s_byte(0x00, name='control_field_3', fuzzable=False)
+        s_byte(0x00, name='control_field_4', fuzzable=False)
+    with s_block('asdu'):
+        s_random(0x00, 0, 251, name='random_bytes')
+
+    s_initialize('basic')
+    with s_block('apci_common'):
+        s_byte(0x68, name='start', fuzzable=False)
+        s_size('asdu', name='apdu_length', length=1, offset=4, fuzzable=False)
+    with s_block('i_frame'):
+        s_byte(0x00, name='send_sequence_1', fuzzable=False)
+        s_byte(0x00, name='send_sequence_2', fuzzable=False)
+        s_byte(0x00, name='receive_sequence_1', fuzzable=False)
+        s_byte(0x00, name='receive_sequence_2', fuzzable=False)
+    with s_block('asdu'):
+        s_byte(0x64, name='type', fuzzable=False)
+        s_byte(0x01, name='objects', fuzzable=False)
+        s_byte(0x06, name='cot', fuzzable=False)
+        s_byte(0x00, name='originator', fuzzable=False)
+        s_byte(0x01, name='common_address_1')
+        s_byte(0x00, name='common_address_2', fuzzable=False)
+        s_byte(0x00, name='ioa_1', fuzzable=False)
+        s_byte(0x00, name='ioa_2', fuzzable=False)
+        s_byte(0x00, name='ioa_3', fuzzable=False)
+        s_byte(0x14, name='qoi', fuzzable=False)
+
+    s_initialize('interrogation_append_random')
+    with s_block('apci_common'):
+        s_byte(0x68, name='start', fuzzable=False)
+        s_size('asdu', name='apdu_length', length=1, offset=4, fuzzable=False)
+    with s_block('i_frame'):
+        s_byte(0x00, name='send_sequence_1', fuzzable=False)
+        s_byte(0x00, name='send_sequence_2', fuzzable=False)
+        s_byte(0x00, name='receive_sequence_1', fuzzable=False)
+        s_byte(0x00, name='receive_sequence_2', fuzzable=False)
+    with s_block('asdu'):
+        s_byte(0x64, name='type', fuzzable=False)
+        s_byte(0x01, name='objects', fuzzable=False)
+        s_byte(0x06, name='cot', fuzzable=False)
+        s_byte(0x00, name='originator', fuzzable=False)
+        s_byte(0x01, name='common_address_1')
+        s_byte(0x00, name='common_address_2', fuzzable=False)
+        s_byte(0x00, name='ioa_1', fuzzable=False)
+        s_byte(0x00, name='ioa_2', fuzzable=False)
+        s_byte(0x00, name='ioa_3', fuzzable=False)
+        s_byte(0x14, name='qoi', fuzzable=False)
+        s_random(0x00, 0, 241, name='random_bytes')
+
+    session.connect(s_get('random_bytes'))
+    session.connect(s_get('s_frame_random_cf'))
+    session.connect(s_get('s_frame_append_random'))
+    session.connect(s_get('testfr_act_random_cf'))
+    session.connect(s_get('testfr_con_random_cf'))
+    session.connect(s_get('testfr_act_append_random'))
+    session.connect(s_get('testfr_con_append_random'))
+    session.connect(s_get('interrogation_append_random'))
+    # session.fuzz_single_case(1)
+    session.fuzz()
+    print(log.failure_summary())
+    # keep the web interface alive
+    raw_input('Press Enter key to exit')
+
+
+if __name__ == '__main__':
+    p = argparse.ArgumentParser()
+    p.add_argument('-i', '--ip', type=str, default='localhost')
+    p.add_argument('-p', '--port', type=int, default=2404)
+    p.add_argument('--testfr', action='store_true')
+    p.add_argument('--startdt', action='store_true')
+    p.add_argument('--interrogation', action='store_true')
+    args = p.parse_args()
+    main(args.ip, args.port, testfr=args.testfr, pre_startdt=args.startdt, interrogation=args.interrogation)
+\end{lstlisting}
